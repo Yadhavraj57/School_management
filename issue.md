@@ -19,7 +19,7 @@ This caused the seed command to fail with:
 column users.role does not exist
 ```
 
-An uncommitted alignment migration currently exists at `alembic/versions/f4d3c2b1a090_align_schema_with_current_models.py`, but it requires review before it is used on a populated database.
+No tracked alignment migration currently fixes these differences. A reviewed migration is required before the current ORM can safely use a newly migrated database.
 
 ### 2. Students can read any student's private information
 
@@ -115,11 +115,9 @@ CompileError: Can't emit DROP CONSTRAINT ... it has no name
 
 Relevant code: `alembic/versions/21d66fd12994_add_class_teacher_to_class.py` and other migrations that use `drop_constraint(None, ...)`.
 
-### 12. The alignment migration is unsafe for populated databases
+### 12. A safe schema-alignment migration is missing
 
-The current uncommitted alignment migration drops legacy columns and changes nullability without a complete data migration strategy. This may be acceptable for confirmed-empty tables, but it could destroy data or fail when applied to an existing populated deployment.
-
-Relevant code: `alembic/versions/f4d3c2b1a090_align_schema_with_current_models.py`.
+The repository needs a migration that reconciles the tracked schema with the ORM. It must preserve or deliberately transform legacy fields and existing data rather than simply dropping columns. Until that migration exists, fresh installations reach an Alembic head that the application cannot use correctly.
 
 ## Validation and reliability issues
 

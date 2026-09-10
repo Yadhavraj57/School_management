@@ -1,6 +1,6 @@
 # Student & School Management API: Comprehensive Developer Reference & Architecture Guide
 
-This document provides an exhaustive, authoritative technical guide to the **Student & School Management API**.
+This document provides a technical guide to the current **Student & School Management API** implementation.
 
 It details the system architecture, explains every single application module in depth based on the current codebase, documents data models, schemas, authentication and Role-Based Access Control (RBAC), API endpoints, transaction flows, and database migrations with Alembic.
 
@@ -8,15 +8,15 @@ It details the system architecture, explains every single application module in 
 
 ## 1. Project Architecture Overview
 
-The application is built using a modern, asynchronous-capable Python backend stack designed for high performance, type safety, security, and clean separation of concerns:
+The application is built as a synchronous FastAPI and SQLAlchemy backend:
 
 * **API Framework**: [FastAPI](https://fastapi.tiangolo.com/) for high-performance REST endpoints with automatic OpenAPI interactive documentation (`/docs` and `/redoc`).
-* **Authentication & Cryptography**: Direct [Bcrypt](https://pypi.org/project/bcrypt/) integration with explicit 72-byte truncation protection, and [python-jose](https://pypi.org/project/python-jose/) implementing JSON Web Tokens (JWT) through OAuth2 Password Bearer flow.
-* **Role-Based Access Control (RBAC)**: A layered security model with 4 distinct roles (`admin`, `principal`, `teacher`, `student`) strictly enforced at the route dependency layer.
+* **Authentication & Cryptography**: Direct [Bcrypt](https://pypi.org/project/bcrypt/) integration and [python-jose](https://pypi.org/project/python-jose/) JSON Web Tokens (JWT) through an OAuth2 Password Bearer flow. The current bcrypt length handling is defective for multibyte Unicode passwords; see the security limitations below.
+* **Role-Based Access Control (RBAC)**: Route dependencies recognize 4 roles (`admin`, `principal`, `teacher`, `student`). Most modifying operations have role checks, but the single-student and single-teacher read endpoints currently have object-level authorization gaps.
 * **ORM (Object Relational Mapper)**: [SQLAlchemy 2.0](https://www.sqlalchemy.org/) managing relational mappings, connection pooling, and SQL compilation.
-* **Data Validation & Serialization**: [Pydantic v2](https://docs.pydantic.dev/) for strict type validation, request parsing, and response serialization (`from_attributes = True`).
-* **Database Migrations**: [Alembic](https://alembic.sqlalchemy.org/) maintaining linear, version-controlled PostgreSQL schema revisions.
-* **Database & Driver**: [PostgreSQL](https://www.postgresql.org/) accessed via the [psycopg2-binary](https://pypi.org/project/psycopg2-binary/) adapter.
+* **Data Validation & Serialization**: [Pydantic v2](https://docs.pydantic.dev/) for request parsing and response serialization (`from_attributes = True`). Domain validation is currently limited.
+* **Database Migrations**: [Alembic](https://alembic.sqlalchemy.org/) provides a linear revision history, but the tracked migrations are not synchronized with the current ORM models.
+* **Database & Driver**: [PostgreSQL](https://www.postgresql.org/) accessed through the Psycopg 3 `psycopg[binary]` package.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -58,7 +58,7 @@ The application is built using a modern, asynchronous-capable Python backend sta
 ## 2. Directory & File Structure
 
 ```text
-Student_CRUD_Application/
+School_management/
 │
 ├── app/
 │   ├── __init__.py           # Package initializer
@@ -84,6 +84,8 @@ Student_CRUD_Application/
 ├── requirements.txt          # Python project dependencies
 ├── .env                      # Environment configuration (DATABASE_URL, SECRET_KEY, etc.)
 ├── .env.example              # Example environment configuration template
+├── README.md                 # Short repository description
+├── issue.md                  # Prioritized codebase audit and known issues
 ├── routes_guide.md           # Quickstart endpoint documentation
 ├── updates.md                # Comprehensive record of changes from previous versions
 └── overview.md               # Complete developer and architectural reference
@@ -113,6 +115,8 @@ Manages database connectivity and per-request session lifecycles:
   * `expire_on_commit=False`: Prevents cached object attributes from expiring after commit, eliminating `DetachedInstanceError` during FastAPI response serialization.
 * **`Base = declarative_base()`**: Base class for all ORM models.
 * **`get_db()`**: FastAPI dependency generator that yields an isolated `SessionLocal` instance per request and guarantees `db.close()` inside a `finally` block.
+
+The current implementation does not validate configuration before creating the engine. A missing or malformed `DATABASE_URL` therefore causes an import/startup error rather than a targeted configuration message. The checked-in `.env.example` is also empty and must be completed before it can serve as a setup template.
 
 ---
 
@@ -231,10 +235,11 @@ Handles password hashing, token generation, user verification, and role access c
       salt = bcrypt.gensalt()
       return bcrypt.hashpw(password_bytes, salt).decode("utf-8")
   ```
-  * Protects against bcrypt buffer overflow crashes by truncating input to 72 bytes explicitly before encoding.
+  * **Known defect**: `password[:72]` limits Unicode code points before UTF-8 encoding; it does not limit the encoded password to 72 bytes. Some multibyte passwords still exceed bcrypt's limit and raise `ValueError`. It also silently makes different long ASCII passwords equivalent when their first 72 characters match. Password length should be validated by encoded byte length, or the application should adopt a password scheme without this truncation behavior.
 
 * **JWT Generation (`create_access_token`)**:
   * Encodes payload (`sub` set to user's email, `role`) and sets UTC expiration (`ACCESS_TOKEN_EXPIRE_MINUTES`, default 30 min) signed with `SECRET_KEY` and `HS256`.
+  * **Known risk**: if `SECRET_KEY` is not configured, the application falls back to the publicly known value `fallback_secret_change_me`. Production startup should fail instead of accepting this fallback.
 
 * **Current User Dependency (`get_current_user`)**:
   * Extracts Bearer token from `Authorization` header via `OAuth2PasswordBearer(tokenUrl="/auth/login")`.
@@ -253,6 +258,8 @@ Handles password hashing, token generation, user verification, and role access c
           return current_user
       return role_checker
   ```
+
+Role checks alone do not provide record-level authorization. At present, any authenticated account can call `GET /students/{student_id}` and `GET /teachers/{teacher_id}` for arbitrary IDs.
 
 ---
 
@@ -289,6 +296,12 @@ Contains transaction handling and atomic entity-profile synchronization:
 * **`unenroll_student_from_subject(db, student_id, subject_id, current_user)`**:
   * Enforces teacher ownership check, validates active enrollment, and removes subject from `student.subjects`.
 
+Known limitations in this layer:
+
+* Email changes update the profile and `User.email`, but do not update `User.username`, even though new accounts initially use the email as their username.
+* Several `IntegrityError` handlers expose raw database error details in API responses.
+* Pagination values are not bounded, and update schemas permit explicit `null` values for database-required fields such as `name` and `email`.
+
 ---
 
 ### F. `app/main.py` — REST Endpoints & Route Definitions
@@ -304,15 +317,17 @@ Defines route paths, HTTP verbs, status codes, response schemas, and RBAC guards
 | **Students** | `POST` | `/students/` | `admin`, `principal` | Create student account & profile | `201 Created` |
 | **Students** | `GET` | `/students/` | `admin`, `principal`, `teacher` | List all students (paginated) | `200 OK` |
 | **Students** | `GET` | `/students/{student_id}` | Authenticated (`get_current_user`) | Get single student details | `200 OK` |
-| **Students** | `PUT` | `/students/{student_id}` | `admin`, `principal` | Update student profile and credentials | `200 OK` |
+| **Students** | `PUT` | `/students/{student_id}` | `admin`, `principal` | Update student profile and linked account email | `200 OK` |
 | **Students** | `DELETE`| `/students/{student_id}` | `admin`, `principal` | Delete student and linked user account | `204 No Content` |
 | **Teachers** | `POST` | `/teachers/` | `admin`, `principal` | Create teacher account & profile | `201 Created` |
 | **Teachers** | `GET` | `/teachers/` | `admin`, `principal` | List all teachers (paginated) | `200 OK` |
 | **Teachers** | `GET` | `/teachers/{teacher_id}` | Authenticated (`get_current_user`) | Get single teacher details | `200 OK` |
-| **Teachers** | `PUT` | `/teachers/{teacher_id}` | `admin`, `principal` | Update teacher profile and credentials | `200 OK` |
+| **Teachers** | `PUT` | `/teachers/{teacher_id}` | `admin`, `principal` | Update teacher profile and linked account email | `200 OK` |
 | **Teachers** | `DELETE`| `/teachers/{teacher_id}` | `admin`, `principal` | Delete teacher and linked user account | `204 No Content` |
 | **Enrollment**| `POST` | `/students/{student_id}/subjects/{subject_id}/enroll` | `admin`, `principal`, `teacher` | Enroll student into a subject | `200 OK` |
 | **Enrollment**| `POST` | `/students/{student_id}/subjects/{subject_id}/unenroll` | `admin`, `principal`, `teacher` | Remove student from a subject | `200 OK` |
+
+The endpoint table above is exhaustive for the current `app/main.py`. Although `Class` and `Subject` models exist, there are no class CRUD, subject CRUD, user-administration, or current-user endpoints. Subjects and classes must therefore be populated outside the current API before related workflows can be used. The separate `routes_guide.md` still documents several endpoints that are not implemented and should not be treated as authoritative.
 
 ---
 
@@ -326,8 +341,10 @@ An initialization utility that populates default administrative and instructor a
 
 To execute the seeder:
 ```bash
-python -m app.seed_roles
+.venv/bin/python -m app.seed_roles
 ```
+
+The seeded passwords are predictable development defaults and must not be used in production. The current script also catches errors without returning a failing process status, and it does not recreate a missing teacher profile when the teacher user already exists.
 
 ---
 
@@ -349,7 +366,7 @@ python -m app.seed_roles
             │                                 │
             ▼                                 ▼
 [ auth.verify_password ]             [ HTTP 401 Unauthorized ]
-   - Truncates to 72 bytes
+   - Slices to 72 characters (known byte-length defect)
    - bcrypt.checkpw
             │
       ┌─────┴─────┐
@@ -438,7 +455,7 @@ Header: Authorization: Bearer <token>
 
 ## 5. Database Migrations with Alembic
 
-The database schema evolution is tracked linearly in the `alembic/versions/` directory:
+The repository contains a linear Alembic history, but its current head does **not** match `app/models.py`.
 
 ### Linear Migration Chain
 
@@ -455,8 +472,22 @@ The database schema evolution is tracked linearly in the `alembic/versions/` dir
 [ 21d66fd12994 ] (Add class_teacher_id foreign key constraint to classes)
         │
         ▼
-[ a22fb04d03dd ] (Add users table with username, email, hashed_password, is_active) [HEAD]
+[ a22fb04d03dd ] (Add users table with username, email, hashed_password, is_active) [TRACKED HEAD]
 ```
+
+### Current schema mismatch
+
+After upgrading to the tracked head, the database still differs from the ORM in material ways:
+
+| ORM expectation | Tracked migration result |
+| :--- | :--- |
+| `users.role` exists | Column is missing |
+| `students.user_id` links to `users.id` | Column and foreign key are missing |
+| `teachers.user_id` links to `users.id` | Column and foreign key are missing |
+| Association table is `student_subject` | Migration creates `student_subjects` |
+| Legacy fields are absent | Migrations retain required fields such as `students.department`, `classes.section`, and `subjects.code` |
+
+Because of this mismatch, `python -m app.seed_roles` fails at the tracked head with `column users.role does not exist`, and normal ORM operations cannot be relied upon. A reviewed schema-alignment migration is required before seeding or running the API against a newly migrated database.
 
 ### Key Alembic Commands
 
@@ -464,7 +495,7 @@ The database schema evolution is tracked linearly in the `alembic/versions/` dir
   ```bash
   alembic upgrade head
   ```
-* **Rollback the most recent migration**:
+* **Rollback the most recent migration** *(currently unsafe; see warning below)*:
   ```bash
   alembic downgrade -1
   ```
@@ -477,11 +508,13 @@ The database schema evolution is tracked linearly in the `alembic/versions/` dir
   alembic history --verbose
   ```
 
+**Downgrade warning:** static PostgreSQL downgrade generation currently fails because older revisions call `drop_constraint(None, ...)` for unnamed constraints. Constraint names and downgrade implementations must be corrected before rollback commands are relied upon.
+
 ---
 
 ## 6. SQL Compilation & Query Translation
 
-SQLAlchemy 2.0 compiles Python ORM expressions into dialect-specific PostgreSQL queries:
+SQLAlchemy 2.0 compiles Python ORM expressions into dialect-specific PostgreSQL queries. These examples reflect the ORM models; they only work after the physical database schema has been aligned with those models:
 
 | Python Operation | Compiled PostgreSQL Statement |
 | :--- | :--- |
@@ -494,16 +527,24 @@ SQLAlchemy 2.0 compiles Python ORM expressions into dialect-specific PostgreSQL 
 
 ---
 
-## 7. Security Best Practices & Design Decisions
+## 7. Security Behavior and Known Limitations
 
-1. **Bcrypt 72-Byte Boundary Protection**:
-   * Bcrypt natively truncates or errors on inputs exceeding 72 bytes. The auth helper explicitly applies `[:72].encode("utf-8")` to guarantee stability and prevent Denial of Service (DoS) through unbounded password lengths.
-2. **Coupled Account-Profile Lifecycle**:
+1. **Password hashing limitation**:
+   * Bcrypt accepts at most 72 bytes, but the current helper slices 72 characters before UTF-8 encoding. This does not guarantee a 72-byte input and can crash for multibyte passwords. It also causes passwords that differ only after the first 72 ASCII characters to authenticate identically.
+2. **Coupled account-profile lifecycle**:
    * Creating a student or teacher automatically creates their authentication `User` entity.
    * Deleting a student or teacher deletes the underlying `User` record to prevent orphaned authentication records.
-   * Updating a student or teacher's email synchronizes `User.email` in lockstep.
-3. **Strict RBAC Separation**:
-   * Route dependencies (`auth.require_roles`) isolate administrative capabilities from instructors and learners.
+   * Updating a student or teacher's email synchronizes `User.email`, but currently leaves `User.username` unchanged.
+3. **RBAC coverage**:
+   * Route dependencies (`auth.require_roles`) protect student and teacher write operations and student-list access.
    * Subject enrollments verify teacher ownership, ensuring instructors can only enroll students in their assigned subjects.
-4. **Session Lifecycle Guarantees**:
-   * `expire_on_commit=False` prevents lazy loading detachment errors across asynchronous and dependency boundaries in FastAPI.
+   * The individual student and teacher read endpoints require authentication but do not enforce role or ownership checks.
+4. **JWT configuration risk**:
+   * Tokens expire and authenticated requests reload the user from the database, allowing inactive accounts to be rejected.
+   * The fixed fallback `SECRET_KEY` is insecure. There is no token revocation, refresh-token mechanism, or login rate limiting.
+5. **Session lifecycle**:
+   * `expire_on_commit=False` keeps loaded attributes available for response serialization after a commit, while `get_db()` closes the request session in a `finally` block.
+
+## 8. Current Operational and Quality Gaps
+
+The repository currently has no automated tests or CI workflow. It also lacks health/readiness endpoints, security/audit logging, CORS configuration for browser clients, bounded pagination, a dependency lock file, and a documented production deployment process. See `issue.md` for the prioritized audit.
